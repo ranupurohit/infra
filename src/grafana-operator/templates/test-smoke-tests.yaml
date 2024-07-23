@@ -1,0 +1,93 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ template "common.names.fullname" . }}-smoketest
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "common.labels.standard" . | nindent 4 }}
+    {{- if .Values.commonLabels }}
+    {{- include "common.tplvalues.render" ( dict "value" .Values.commonLabels "context" $ ) | nindent 4 }}
+    {{- end }}
+    app.kubernetes.io/component: smoketest
+  annotations:
+    "helm.sh/hook": "post-install,post-upgrade"
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": "hook-succeeded"
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+    seccomp.security.alpha.kubernetes.io/pod: "docker/default"
+spec:
+  template:
+    spec:
+      securityContext:
+          fsGroup: 10001
+      serviceAccountName: {{ include "common.names.fullname" . }}
+      containers:
+      - name: post-install-smoketest
+        image: {{ .Values.operator.image.registry }}/awsdevops/k8s-tools:v1.0.0
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          readOnlyRootFilesystem: true
+          runAsUser: 10001
+          capabilities:
+            drop: ["ALL"]
+        imagePullPolicy: Always
+        command:
+          - "/bin/bash"
+          - "-c"
+          - |
+             set -ex
+             # Check SVC
+             kubectl get svc -l app.kubernetes.io/instance={{ .Release.Name }} > /dev/null
+
+             # Wait for PODs deployed and ready
+             kubectl wait pod --for=condition=Ready -l app.kubernetes.io/instance={{ .Release.Name }} --timeout=120s
+
+             # Check PODs status
+             [ ! -z $(kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }} -o=jsonpath={.items[0].status.containerStatuses[0].ready} | jq 'select(. == true) ') ]
+
+             # Check endpoint status
+             rc=$(curl -nks -o /dev/null -w '%{response_code}' https://{{ .Values.grafana.ingress.host }}/login )
+             [  $rc == "200" ] || [  $rc == "401" ] || exit 1
+
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9091
+          initialDelaySeconds: 10
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9091
+          initialDelaySeconds: 10
+          timeoutSeconds: 10
+        {{- if .Values.smokeTest.resources }}
+        resources: {{- toYaml .Values.smokeTest.resources | nindent 10 }}
+        {{- end }}
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 0
+  backoffLimit: 6
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: "{{ template "common.names.fullname" . }}-smoketest"
+rules:
+- apiGroups: [""]
+  resources: ["services", "pods"]
+  verbs: ["get","watch","list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: "{{ template "common.names.fullname" . }}-smoketest"
+subjects:
+- kind: ServiceAccount
+  name: {{ include "common.names.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: "{{ template "common.names.fullname" . }}-smoketest"
+  apiGroup: rbac.authorization.k8s.io
